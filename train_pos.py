@@ -4,13 +4,17 @@ import torchvision.transforms as T
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
-from torch.utils.data import  DataLoader,random_split, Subset
-from Generator.Dataset import CustomDataset_1
+from torch.utils.data import  DataLoader,random_split
+from Generator.Dataset import CustomDataset, CustomNoiseImageDataset
 from Generator.NN import NNDenoiser
 from Generator.add_noise import add_noise
 from Generator.positional_encoding import positional_encoding
 import csv
 import os
+os.environ["PYTORCH_ALLOC_CONF"] = "max_split_size_mb:128"
+os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
+
+import torch
 
 
 transform = T.Compose([
@@ -20,7 +24,9 @@ transform = T.Compose([
     T.Normalize([0.5]*3, [0.5]*3) 
 ])
 
-dataset = CustomDataset_1("data/", transform=transform)
+dataset = CustomDataset("data/", transform=transform, add_noise=add_noise)
+
+dataset = CustomNoiseImageDataset(dataset)
 
 #indices = np.random.choice(len(dataset), size=5000, replace=False)
 #small_dataset = Subset(dataset, indices)
@@ -35,18 +41,18 @@ train_dataset, val_dataset = random_split(
 
 train_loader = DataLoader(
     train_dataset,
-    batch_size=8,
+    batch_size=128,
     shuffle=True,
-    num_workers=6
+    num_workers=1
 )
 val_loader = DataLoader(
     val_dataset,
-    batch_size=8,
+    batch_size=128,
     shuffle=False,
-    num_workers=4
+    num_workers=1
 )
 
-log_file = "artifacts/new/training_log_nn.csv"
+log_file = "artifacts/pos/training_log_nn.csv"
 if not os.path.exists(log_file):
     with open(log_file, mode="w", newline="") as f:
         writer = csv.writer(f)
@@ -65,76 +71,59 @@ scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
 )
 loss_fn = nn.MSELoss()
 
-num_epochs = 100
-
+num_epochs = 500
+positional_encoded = positional_encoding(10000, 4096).to(device)
 best_val = float("inf")
 patience = 5
 counter = 0
+idle_device = "cpu"
+if idle_device:
+    to_idle = lambda x: x.to(idle_device)
+else:
+    to_idle = lambda x: x
 
-num_epochs = 100
-best_val = float("inf")
-patience = 5
-counter = 0
 for epoch in range(1,num_epochs+1):
     model.train()
     train_loss = 0
-    for images in tqdm(train_loader, desc=f"Epoch {epoch} [Train]"):
+    for images, t, noise, t_int in tqdm(train_loader, desc=f"Epoch {epoch} [Train]"):
         images = images.to(device)
+        t = t.to(device)
+        noise = noise.to(device)
+        t_int = t_int.to(device)
         B, C, H, W = images.shape
-        K = 100
 
-        # repeat images
-        images = images.unsqueeze(1).repeat(1, K, 1, 1, 1)   # (B, K, C, H, W)
-        images = images.view(B*K, C, H, W)
-
-        # sample noise
-        noise = torch.randn_like(images)
-
-        # sample t
-        t_int = torch.randint(0, 10000, (B*K, 1, 1, 1), device=device)
-        t = t_int.float() / 10000.0
-
-        xt = add_noise(images, t, noise)
-        
+        t_i = t_int.flatten()
+        t_i = positional_encoded[t_i,:].view(B, -1)
         optimizer.zero_grad()
-
-        pred_grad = model(xt, t_int)
+        pred_grad = model(images,t_i)
         loss = ((pred_grad - (noise - images))**2).mean()
         loss.backward()
         optimizer.step()
         train_loss += loss.item() * images.size(0)
 
-    train_loss /= (len(train_loader.dataset)*K)
+    train_loss /= len(train_loader.dataset)
 
     # validation
     model.eval()
     val_loss = 0
     with torch.no_grad():
-        for images in tqdm(val_loader, desc=f"Epoch {epoch} [Val]"):
+        for images,t,noise, t_int in tqdm(val_loader, desc=f"Epoch {epoch} [Val]"):
             images = images.to(device)
+            t = t.to(device)
+            noise = noise.to(device)
+            t_int = t_int.to(device)
             B, C, H, W = images.shape
-            K = 100
 
-            # repeat images
-            images = images.unsqueeze(1).repeat(1, K, 1, 1, 1)   # (B, K, C, H, W)
-            images = images.view(B*K, C, H, W)
+            t_i = t_int.flatten()
+            t_i = positional_encoded[t_i,:].view(B, -1)
 
-            # sample noise
-            noise = torch.randn_like(images)
-
-            # sample t
-            t_int = torch.randint(0, 10000, (B*K, 1, 1, 1), device=device)
-            t = t_int.float() / 10000.0
-
-            xt = add_noise(images, t, noise)
-
-            pred_grad = model(xt, t_int)
+            pred_grad = model(images,t_i)
             loss = ((pred_grad - (noise - images))**2).mean()
-            #loss = loss_fn(pred_grad, noise - images)
             val_loss += loss.item() * images.size(0)
 
-    val_loss /= (len(val_loader.dataset)*K)
+    val_loss /= len(val_loader.dataset)
     scheduler.step(val_loss)
+    
 
     print(f"Epoch {epoch+1}: Train Loss = {train_loss:.4f}, Val Loss = {val_loss:.4f}")
     # log CSV
@@ -143,5 +132,16 @@ for epoch in range(1,num_epochs+1):
         writer.writerow([epoch, train_loss, val_loss])
 
     # save checkpoint 
-    torch.save(model.state_dict(), f"artifacts/new/model_{epoch}.pt")
+    torch.save(model.state_dict(), f"artifacts/pos/model_{epoch}.pt")
+    
+    # early stopping
+    if val_loss < best_val:
+        best_val = val_loss
+        counter = 0
+        torch.save(model.state_dict(), "artifacts/pos/best.pt")
+    else:
+        counter += 1
+        if counter >= patience:
+            print("Early stopping")
+            break
 

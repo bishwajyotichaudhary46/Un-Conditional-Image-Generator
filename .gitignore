@@ -12,6 +12,7 @@ un_env/
 data/
 artifacts/
 artifacts_latent/
+minist_artifacts/
 
 
 # Distribution / packaging
